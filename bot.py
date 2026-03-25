@@ -1,15 +1,23 @@
-import telebot
-import duckdb
+import asyncio
+import logging
 import re
 import os
+import duckdb
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import Message
 
-# Конфигурация
+# Настройки
 TOKEN = '8732991094:AAEy2WRb3BuAB1qqvhD0GtC6VxepdjZiJAs'
 DB_FILE = "kundelik_search.duckdb"
 
-bot = telebot.TeleBot(TOKEN)
+# Включаем логирование, чтобы видеть ошибки в панели хостинга
+logging.basicConfig(level=logging.INFO)
 
-def normalize_text(text):
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+def normalize_text(text: str) -> str:
     if not text: return ""
     text = text.lower().strip()
     mapping = {'қ': 'к', 'ң': 'н', 'ғ': 'г', 'ү': 'у', 'ұ': 'у', 'ө': 'о', 'ә': 'а', 'і': 'и'}
@@ -17,30 +25,48 @@ def normalize_text(text):
         text = text.replace(src, dst)
     return re.sub(r'[^\w\s]+', ' ', text)
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, "🔍 Бот готов к поиску по базе Kundelik. Введите ФИО или ИИН.")
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer("🔍 **Kundelik OSINT Bot** на aiogram.\nВведите ФИО, ИИН или телефон для поиска.")
 
-@bot.message_handler(func=lambda message: True)
-def search_handler(message):
+@dp.message()
+async def search_handler(message: Message):
     query = message.text.strip()
     
     if len(query) < 3:
-        bot.reply_to(message, "⚠️ Слишком короткий запрос (минимум 3 символа).")
+        await message.answer("⚠️ Запрос слишком короткий (нужно хотя бы 3 символа).")
         return
 
     if not os.path.exists(DB_FILE):
-        bot.reply_to(message, "🛑 База данных еще не создана на хостинге. Запустите сначала процесс индексации.")
+        await message.answer("🛑 Файл базы данных `kundelik_search.duckdb` не найден на сервере.")
         return
 
+    # Запускаем поиск в отдельном потоке, чтобы бот не "фризил"
+    loop = asyncio.get_event_loop()
+    results = await loop.run_in_executor(None, perform_search, query)
+
+    if not results:
+        await message.answer("❌ Ничего не найдено.")
+        return
+
+    for r in results:
+        resp = (
+            f"👤 *ФИО:* {r[0]}\n"
+            f"📅 *ДР:* {r[1] or '---'}\n"
+            f"📞 *Тел:* {r[2] or '---'}\n"
+            f"🆔 *ИИН:* {r[3] or '---'}\n"
+            f"🏫 *Школа:* {r[4] or '---'}\n"
+            f"👪 *Родитель:* {r[5] or '---'}"
+        )
+        await message.answer(resp, parse_mode="Markdown")
+
+def perform_search(query: str):
+    """Логика поиска в DuckDB"""
     try:
-        # Подключаемся к базе (только чтение)
         conn = duckdb.connect(DB_FILE, read_only=True)
+        norm_q = normalize_text(query)
+        like_val = f"%{norm_q}%"
         
-        norm_query = normalize_text(query)
-        like_val = f"%{norm_query}%"
-        
-        # Твой SQL запрос
         sql = """
             SELECT fio, birthdate, phone, iin, school, parent 
             FROM clean_students 
@@ -48,28 +74,15 @@ def search_handler(message):
             OR normalized_fio LIKE ? 
             LIMIT 5
         """
-        
-        results = conn.execute(sql, [like_val, like_val]).fetchall()
+        res = conn.execute(sql, [like_val, like_val]).fetchall()
         conn.close()
-
-        if not results:
-            bot.send_message(message.chat.id, "❌ Ничего не найдено.")
-            return
-
-        for r in results:
-            response = (
-                f"👤 *ФИО:* {r[0]}\n"
-                f"📅 *ДР:* {r[1] or '---'}\n"
-                f"📞 *Тел:* {r[2] or '---'}\n"
-                f"🆔 *ИИН:* {r[3] or '---'}\n"
-                f"🏫 *Школа:* {r[4] or '---'}\n"
-                f"👪 *Родитель:* {r[5] or '---'}"
-            )
-            bot.send_message(message.chat.id, response, parse_mode="Markdown")
-
+        return res
     except Exception as e:
-        bot.send_message(message.chat.id, f"🛑 Ошибка поиска: {str(e)}")
+        logging.error(f"Search error: {e}")
+        return []
 
-if __name__ == '__main__':
-    print("Бот запущен...")
-    bot.polling(none_stop=True)
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
